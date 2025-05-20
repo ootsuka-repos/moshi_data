@@ -14,8 +14,8 @@ import glob
 
 # dataディレクトリ内の全MP4/WAVファイルを取得
 import itertools
-mp4_files = glob.glob("audio/*.mp4")
-wav_files = glob.glob("audio/*.wav")
+mp4_files = glob.glob("inputs/*.mp4") # 入力ディレクトリを inputs/ に変更
+wav_files = glob.glob("inputs/*.wav") # 入力ディレクトリを inputs/ に変更
 media_files = list(itertools.chain(mp4_files, wav_files))
 
 # config for kotoba-whisper
@@ -57,169 +57,217 @@ os.makedirs("text", exist_ok=True)
 import json
 
 for media_path in media_files:
-    base = os.path.splitext(os.path.basename(media_path))[0]
-    ext = os.path.splitext(media_path)[1].lower()
-    wav_path = f"audio/{base}.wav"
-    output_json = f"text/{base}.json"
+    base_name = os.path.splitext(os.path.basename(media_path))[0]
+    file_ext = os.path.splitext(media_path)[1].lower()
+    
+    output_wav_path = f"audio/{base_name}.wav" # 出力WAVファイルパス
+    output_json_path = f"text/{base_name}.json" # 出力JSONファイルパス
+    
     results = []
+    ab_segments = {"A": [], "B": []} # 話者ごとの音声セグメントを保存
 
-    # MP4の場合はWAVに変換し、変換後にMP4を削除
-    if ext == ".mp4":
-        if not os.path.exists(wav_path):
+    # audio と text ディレクトリがなければ作成
+    os.makedirs("audio", exist_ok=True)
+    os.makedirs("text", exist_ok=True)
+
+    processed_audio_path = media_path # 初期値は入力パス
+    temp_conversion_wav_path = None # MP4から変換した一時WAVのパス
+
+    if file_ext == ".mp4":
+        temp_conversion_wav_path = f"audio/temp_conversion_{base_name}.wav"
+        print(f"Converting MP4 '{media_path}' to WAV '{temp_conversion_wav_path}'")
+        try:
             video = VideoFileClip(media_path)
             audio = video.audio
-            # 16kHz, モノラル, s16leで保存 (Whisperの期待する形式)
-            audio.write_audiofile(wav_path, fps=16000, nbytes=2, codec='pcm_s16le')
+            # 16kHz, モノラル, s16leで保存
+            audio.write_audiofile(temp_conversion_wav_path, fps=16000, nbytes=2, codec='pcm_s16le')
             audio.close()
             video.close()
-        # 変換後にmp4削除
-        if os.path.exists(media_path): # 念のため存在確認
-            os.remove(media_path)
+            processed_audio_path = temp_conversion_wav_path
+        except Exception as e:
+            print(f"Error converting MP4 {media_path}: {e}")
+            if temp_conversion_wav_path and os.path.exists(temp_conversion_wav_path):
+                os.remove(temp_conversion_wav_path)
+            continue # このファイルの処理をスキップ
+    elif file_ext != ".wav":
+        print(f"Skipping unsupported file type: {media_path}")
+        continue
 
-    # 音声ファイルを指定
-    audio_file = wav_path if ext == ".mp4" or not media_path.endswith(".wav") else media_path
-
-    # # 話者分離の実行 (ファイル全体ではなくチャンクごとに行う)
-    # diarization = pyannote_pipeline(audio_file) # この行はチャンク処理ループ内に移動
-
+    print(f"Processing file: {processed_audio_path}")
     # WAVファイルをAudioSegmentで読み込む
-    full_audio_segment = AudioSegment.from_file(audio_file, format="wav")
-
+    try:
+        audio_segment_full = AudioSegment.from_file(processed_audio_path, format="wav")
+    except Exception as e:
+        print(f"Error loading audio file {processed_audio_path}: {e}")
+        if temp_conversion_wav_path and os.path.exists(temp_conversion_wav_path):
+            os.remove(temp_conversion_wav_path)
+        continue
+    
     # 音声ファイルを16kHz、モノラルに変換 (MP4からの変換時に実施済みだが念のため)
-    full_audio_segment = full_audio_segment.set_frame_rate(16000).set_channels(1)
+    audio_segment_full = audio_segment_full.set_frame_rate(16000).set_channels(1)
+
+    if len(audio_segment_full) == 0:
+        print(f"Skipping empty audio file: {processed_audio_path}")
+        if temp_conversion_wav_path and os.path.exists(temp_conversion_wav_path):
+            os.remove(temp_conversion_wav_path)
+        continue
+
+    # 話者分離の実行 (ファイル全体に対して)
+    # pyannoteに渡すために、AudioSegmentを一時ファイルとして保存する必要がある場合がある。
+    # processed_audio_path が一時ファイルでない場合（元のWAVファイルの場合）、
+    # それをpyannoteに渡せるか、あるいは一時的なモノラルWAVを作成するか検討。
+    # ここでは、MP4からの変換で既に一時WAVになっているか、元のWAVパスをそのまま使用。
+    # ただし、pyannoteがAudioSegmentオブジェクトを直接受け付けないため、
+    # 常にファイルパス（processed_audio_path）を使用する。
+    # もしprocessed_audio_pathが元のWAVで、pyannoteがそれをうまく扱えない場合、
+    # ここで audio_segment_full を一時ファイルにエクスポートする必要が出てくる。
+    # 現状は processed_audio_path を信じる。
+
+    diarization_input_path = processed_audio_path
+    # もし pyannote が AudioSegment から直接処理できず、かつ元のWAVファイルがステレオ等の場合、
+    # ここでモノラル16kHzの一時ファイルを作成する。
+    # audio_segment_full は既にモノラル16kHzなので、これを一時ファイルに書き出す。
+    temp_diarization_input_path = f"audio/temp_diarization_input_{base_name}.wav"
+    audio_segment_full.export(temp_diarization_input_path, format="wav")
+
+
+    try:
+        print(f"Running diarization on: {temp_diarization_input_path}")
+        diarization = pyannote_pipeline(temp_diarization_input_path)
+    except Exception as e:
+        print(f"Error during diarization for file {temp_diarization_input_path}: {e}")
+        if temp_conversion_wav_path and os.path.exists(temp_conversion_wav_path):
+            os.remove(temp_conversion_wav_path)
+        if os.path.exists(temp_diarization_input_path):
+            os.remove(temp_diarization_input_path)
+        continue
+    finally:
+        if os.path.exists(temp_diarization_input_path):
+            os.remove(temp_diarization_input_path)
+
 
     # ステレオWAV作成用の準備 (ファイル全体に対して)
-    sample_rate = full_audio_segment.frame_rate
-    # total_samples = len(full_audio_segment.get_array_of_samples()) # 不要になる
-    duration_sec_total = len(full_audio_segment) / 1000.0
-    stereo_array = np.zeros((int(sample_rate * duration_sec_total), 2), dtype=np.float32)
-    ab_segments = {"A": [], "B": []} # 話者ごとの音声セグメントを保存するために再度有効化
+    sample_rate = audio_segment_full.frame_rate
+    duration_sec = len(audio_segment_full) / 1000.0
+    stereo_array = np.zeros((int(sample_rate * duration_sec) + 100, 2), dtype=np.float32) # 少しバッファを持たせる
 
-    chunk_duration_ms = 3 * 60 * 1000  # 3 minutes in milliseconds
-    num_chunks = int(np.ceil(len(full_audio_segment) / chunk_duration_ms))
+    for segment, _, speaker in diarization.itertracks(yield_label=True):
+        if speaker not in ["SPEAKER_00", "SPEAKER_01"]:
+            continue
 
-    for i in range(num_chunks):
-        chunk_start_ms = i * chunk_duration_ms
-        chunk_end_ms = min((i + 1) * chunk_duration_ms, len(full_audio_segment))
-        current_chunk_audio_pydub = full_audio_segment[chunk_start_ms:chunk_end_ms]
+        start_ms = int(segment.start * 1000)
+        end_ms = int(segment.end * 1000)
+
+        start_ms = max(0, start_ms)
+        end_ms = min(len(audio_segment_full), end_ms)
+        if start_ms >= end_ms:
+            continue
         
-        print(f"Processing chunk {i+1}/{num_chunks} ({chunk_start_ms/1000:.2f}s to {chunk_end_ms/1000:.2f}s of original audio)")
+        segment_audio_pydub = audio_segment_full[start_ms:end_ms]
 
-        # pyannoteに渡すために一時ファイルとしてチャンクを保存
-        temp_chunk_path = f"audio/temp_chunk_{base}_{i}.wav"
-        current_chunk_audio_pydub.export(temp_chunk_path, format="wav")
+        if len(segment_audio_pydub) == 0:
+            continue
 
-        try:
-            # 話者分離の実行 (現在のチャンクに対して)
-            diarization_chunk = pyannote_pipeline(temp_chunk_path)
-        finally:
-            if os.path.exists(temp_chunk_path):
-                os.remove(temp_chunk_path) # 一時ファイルを削除
+        samples = np.array(segment_audio_pydub.get_array_of_samples()).astype(np.float32)
+        if samples.size == 0: continue
+        samples /= np.iinfo(segment_audio_pydub.array_type).max
 
-        # 話者分離の結果をループ処理 (現在のチャンクの分離結果に対して)
-        for segment, _, speaker in diarization_chunk.itertracks(yield_label=True):
-            # segment.start, segment.end はチャンクの先頭からの相対時間(秒)
-            segment_start_in_chunk_ms = int(segment.start * 1000)
-            segment_end_in_chunk_ms = int(segment.end * 1000)
+        speaker_ab = "A" if speaker == "SPEAKER_00" else "B"
+        # ab_segments はファイル単位なので、初期化されたものに追加
+        if speaker_ab not in ab_segments: # 通常は発生しないはず
+            ab_segments[speaker_ab] = []
+        ab_segments[speaker_ab].append((segment.start, segment.end, samples))
 
-            # チャンク内の音声セグメントを抽出
-            segment_audio_for_transcribe_pydub = current_chunk_audio_pydub[segment_start_in_chunk_ms:segment_end_in_chunk_ms]
-            
-            # pydub AudioSegment を numpy 配列に変換 (float32, -1.0 to 1.0)
-            samples = np.array(segment_audio_for_transcribe_pydub.get_array_of_samples()).astype(np.float32)
-            if samples.size == 0: # 空のセグメントはスキップ
-                continue
-            samples /= np.iinfo(segment_audio_for_transcribe_pydub.array_type).max # Normalize to -1.0 to 1.0
 
-            # 配置先チャンネル決定
-            speaker_ab = "A" if speaker == "SPEAKER_00" else "B" if speaker == "SPEAKER_01" else speaker
-            
-            # ステレオWAV再構築用に、絶対時間と対応する波形データを保存
-            # segment.start/end はチャンクの開始からの秒数
-            abs_segment_start_sec = (chunk_start_ms / 1000.0) + segment.start
-            abs_segment_end_sec = (chunk_start_ms / 1000.0) + segment.end
-            ab_segments[speaker_ab].append((abs_segment_start_sec, abs_segment_end_sec, samples)) # samples を保存
+        transcription_result = transcribe_pipe(
+            {"raw": samples, "sampling_rate": segment_audio_pydub.frame_rate},
+            chunk_length_s=15,
+            return_timestamps=True,
+            generate_kwargs=generate_kwargs.copy()
+        )
 
-            # Whisper (transformers pipeline) による文字起こし
-            current_generate_kwargs = generate_kwargs.copy()
-            transcription_result = transcribe_pipe(
-                {"raw": samples, "sampling_rate": segment_audio_for_transcribe_pydub.frame_rate},
-                chunk_length_s=15,
-                return_timestamps=True,
-                generate_kwargs=current_generate_kwargs
-            )
-
-            # transcription_result の形式を確認し、適切に処理する
-            if transcription_result and "chunks" in transcription_result:
-                for chunk_data_item in transcription_result["chunks"]: # 変数名を変更
-                    word_text = chunk_data_item["text"]
-                    if chunk_data_item["timestamp"]:
-                        # chunk_data_item["timestamp"] は文字起こしされたセグメントの先頭からの相対時間
-                        word_start_rel_to_segment_sec = chunk_data_item["timestamp"][0]
-                        word_end_rel_to_segment_sec = chunk_data_item["timestamp"][1]
-                        
-                        # 絶対時間を計算
-                        abs_word_start_time = abs_segment_start_sec + word_start_rel_to_segment_sec
-                        abs_word_end_time = abs_segment_start_sec + word_end_rel_to_segment_sec
-                        
-                        if word_text.strip():
-                            print(f"{abs_word_start_time:.2f},{abs_word_end_time:.2f},{speaker_ab},{word_text}")
-                            results.append({
-                                "speaker": speaker_ab,
-                                "word": word_text,
-                                "start": abs_word_start_time,
-                                "end": abs_word_end_time
-                            })
-            elif transcription_result and "text" in transcription_result:
-                full_text = transcription_result["text"]
-                if full_text.strip():
-                    # この場合のタイムスタンプはセグメント全体のものを利用
-                    print(f"{abs_segment_start_sec:.2f},{abs_segment_end_sec:.2f},{speaker_ab},{full_text} (no word timestamps)")
-                    results.append({
-                        "speaker": speaker_ab,
-                        "word": full_text,
-                        "start": abs_segment_start_sec,
-                        "end": abs_segment_end_sec
-                    })
+        if transcription_result and "chunks" in transcription_result:
+            for chunk_data_item in transcription_result["chunks"]:
+                word_text = chunk_data_item["text"]
+                if chunk_data_item["timestamp"]:
+                    # タイムスタンプはセグメントの先頭からなので、ファイル全体の時間に変換
+                    word_start_time = segment.start + chunk_data_item["timestamp"][0]
+                    word_end_time = segment.start + chunk_data_item["timestamp"][1]
+                    if word_text.strip():
+                        results.append({
+                            "speaker": speaker_ab,
+                            "word": word_text,
+                            "start": round(word_start_time, 3),
+                            "end": round(word_end_time, 3)
+                        })
+        elif transcription_result and "text" in transcription_result:
+            full_text = transcription_result["text"]
+            if full_text.strip():
+                results.append({
+                    "speaker": speaker_ab,
+                    "word": full_text,
+                    "start": round(segment.start, 3), # セグメント全体の開始終了
+                    "end": round(segment.end, 3)
+                })
     
-    # results を 'start' キーでソート (チャンク処理により順序が乱れる可能性があるため)
     results.sort(key=lambda x: x["start"])
 
-    # ステレオ配列にA/Bの音声を配置 (全体の音声に対して)
     for speaker_label, ch_idx in zip(["A", "B"], [0, 1]):
         for seg_start_sec, seg_end_sec, waveform_data in ab_segments.get(speaker_label, []):
             start_sample_idx = int(seg_start_sec * sample_rate)
-            # waveform_data はセグメントの音声データなので、その長さを使う
             end_sample_idx = start_sample_idx + len(waveform_data)
 
-            # 配列の範囲内に収まるように調整
-            if start_sample_idx >= stereo_array.shape[0]:
-                continue
-            if end_sample_idx > stereo_array.shape[0]:
-                waveform_data = waveform_data[:stereo_array.shape[0] - start_sample_idx]
-                end_sample_idx = stereo_array.shape[0]
+            if start_sample_idx >= stereo_array.shape[0]: continue
             
-            if len(waveform_data) > 0:
-                # ターゲットスライスの長さを再確認
-                current_target_slice_len = stereo_array[start_sample_idx:end_sample_idx, ch_idx].shape[0]
-                if len(waveform_data) > current_target_slice_len:
-                     waveform_data = waveform_data[:current_target_slice_len]
-                
-                # waveform_data の長さに合わせて end_sample_idx を調整
-                # これにより、加算時の形状不一致を防ぐ
-                effective_end_sample_idx = start_sample_idx + len(waveform_data)
+            # 波形データの長さに合わせてスライス範囲を調整
+            current_waveform_len = len(waveform_data)
+            effective_end_sample_idx = start_sample_idx + current_waveform_len
 
+            if effective_end_sample_idx > stereo_array.shape[0]:
+                # print(f"Warning: Waveform for speaker {speaker_label} (start {seg_start_sec:.2f}s, len {current_waveform_len}) exceeds stereo_array bounds ({stereo_array.shape[0]}). Truncating.")
+                waveform_data = waveform_data[:stereo_array.shape[0] - start_sample_idx]
+                effective_end_sample_idx = stereo_array.shape[0]
+            
+            if len(waveform_data) > 0 :
                 stereo_array[start_sample_idx:effective_end_sample_idx, ch_idx] += waveform_data
+    
+    # stereo_array の末尾の余分なゼロをトリム (バッファ分)
+    # 実際にデータが書き込まれた最大のインデックスを見つける
+    last_written_idx = 0
+    for speaker_label in ["A", "B"]:
+        for seg_start_sec, _, waveform_data in ab_segments.get(speaker_label, []):
+            idx = int(seg_start_sec * sample_rate) + len(waveform_data)
+            if idx > last_written_idx:
+                last_written_idx = idx
+    
+    # 実際の音声長に合わせて stereo_array をトリム
+    # last_written_idx が stereo_array の長さを超えることはないはずだが、念のため min を取る
+    actual_len_samples = min(last_written_idx, stereo_array.shape[0])
+    stereo_array_trimmed = stereo_array[:actual_len_samples, :]
 
 
-    # [-1.0, 1.0]をint16に変換
-    stereo_array = np.clip(stereo_array, -1.0, 1.0)
-    stereo_int16 = (stereo_array * 32767).astype(np.int16)
+    stereo_array_trimmed = np.clip(stereo_array_trimmed, -1.0, 1.0)
+    stereo_int16 = (stereo_array_trimmed * 32767).astype(np.int16)
+    
+    if stereo_int16.size == 0:
+        print(f"Warning: Resulting stereo audio for {base_name} is empty. Skipping WAV write.")
+    else:
+        try:
+            wavfile.write(output_wav_path, sample_rate, stereo_int16)
+            print(f"Successfully wrote stereo WAV: {output_wav_path}")
+        except Exception as e:
+            print(f"Error writing WAV file {output_wav_path}: {e}")
 
-    # ステレオWAVとして保存
-    stereo_wav_path = f"audio/{base}.wav" # 元のファイル名で上書き
-    wavfile.write(stereo_wav_path, sample_rate, stereo_int16)
-
-    # 結果をjsonファイルに保存
-    with open(output_json, "w", encoding="utf-8") as f:
+    with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"Successfully wrote JSON: {output_json_path}")
+
+    # MP4から変換した一時ファイルを削除
+    if temp_conversion_wav_path and os.path.exists(temp_conversion_wav_path):
+        os.remove(temp_conversion_wav_path)
+        print(f"Deleted temporary conversion WAV: {temp_conversion_wav_path}")
+    
+    # 元のMP4ファイルを削除する場合のロジック（必要ならコメント解除）
+    # if file_ext == ".mp4" and os.path.exists(media_path):
+    #     print(f"Deleting original MP4 file: {media_path}")
+    #     os.remove(media_path)
