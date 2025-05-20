@@ -87,7 +87,7 @@ for media_path in media_files:
                 print(f"{start_time:.2f},{end_time:.2f},{speaker},{data['text']}")
                 results.append({
                     "speaker": speaker,
-                    "text": data["text"],
+                    "word": data["text"],
                     "start": start_time,
                     "end": end_time
                 })
