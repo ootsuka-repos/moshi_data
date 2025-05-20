@@ -84,9 +84,11 @@ for media_path in media_files:
             start_time = segment.start + data["start"]
             end_time = segment.start + data["end"]
             if data["text"].strip():
-                print(f"{start_time:.2f},{end_time:.2f},{speaker},{data['text']}")
+                # speakerをA/Bに変換
+                speaker_ab = "A" if speaker == "SPEAKER_00" else "B" if speaker == "SPEAKER_01" else speaker
+                print(f"{start_time:.2f},{end_time:.2f},{speaker_ab},{data['text']}")
                 results.append({
-                    "speaker": speaker,
+                    "speaker": speaker_ab,
                     "word": data["text"],
                     "start": start_time,
                     "end": end_time
