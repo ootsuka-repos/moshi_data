@@ -6,6 +6,7 @@ from pydub import AudioSegment
 from moviepy.editor import VideoFileClip
 import os
 import torch
+from scipy.io import wavfile
 
 import glob
 
@@ -63,29 +64,32 @@ for media_path in media_files:
     # 音声ファイルを16kHz、モノラルに変換
     audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
 
+    # ステレオWAV作成用の準備
+    sample_rate = audio_segment.frame_rate
+    total_samples = len(audio_segment.get_array_of_samples())
+    duration_sec = len(audio_segment) / 1000.0
+    stereo_array = np.zeros((int(sample_rate * duration_sec), 2), dtype=np.float32)  # [サンプル数, チャンネル]
+    ab_segments = {"A": [], "B": []}
+
     # 話者分離の結果をループ処理
     for segment, _, speaker in diarization.itertracks(yield_label=True):
-        # 話者ごとの発話区間の音声を切り出し（ミリ秒単位）
         start_ms = int(segment.start * 1000)
         end_ms = int(segment.end * 1000)
         segment_audio = audio_segment[start_ms:end_ms]
-
-        # 音声データをnumpy配列に変換
         waveform = np.array(segment_audio.get_array_of_samples()).astype(np.float32)
-
-        # 音声データを[-1.0, 1.0]の範囲に正規化
         waveform = waveform / np.iinfo(segment_audio.array_type).max
+
+        # 配置先チャンネル決定
+        speaker_ab = "A" if speaker == "SPEAKER_00" else "B" if speaker == "SPEAKER_01" else speaker
+        ab_segments[speaker_ab].append((segment.start, segment.end, waveform))
 
         # Whisperによる文字起こし（単語タイムスタンプ付き）
         result = model.transcribe(waveform, fp16=True, word_timestamps=True)
 
-        # 話者ラベル付きで文単位でjsonリストを構築
         for data in result["segments"]:
             start_time = segment.start + data["start"]
             end_time = segment.start + data["end"]
             if data["text"].strip():
-                # speakerをA/Bに変換
-                speaker_ab = "A" if speaker == "SPEAKER_00" else "B" if speaker == "SPEAKER_01" else speaker
                 print(f"{start_time:.2f},{end_time:.2f},{speaker_ab},{data['text']}")
                 results.append({
                     "speaker": speaker_ab,
@@ -93,6 +97,25 @@ for media_path in media_files:
                     "start": start_time,
                     "end": end_time
                 })
+
+    # ステレオ配列にA/Bの音声を配置
+    for speaker_ab, ch in zip(["A", "B"], [0, 1]):
+        for seg_start, seg_end, waveform in ab_segments[speaker_ab]:
+            start_idx = int(seg_start * sample_rate)
+            end_idx = start_idx + len(waveform)
+            # 配置範囲が配列を超えないように調整
+            if end_idx > stereo_array.shape[0]:
+                end_idx = stereo_array.shape[0]
+                waveform = waveform[:end_idx - start_idx]
+            stereo_array[start_idx:end_idx, ch] += waveform  # 重なりは加算
+
+    # [-1.0, 1.0]をint16に変換
+    stereo_array = np.clip(stereo_array, -1.0, 1.0)
+    stereo_int16 = (stereo_array * 32767).astype(np.int16)
+
+    # ステレオWAVとして保存
+    stereo_wav_path = f"audio/{base}.wav"
+    wavfile.write(stereo_wav_path, sample_rate, stereo_int16)
 
     # 結果をjsonファイルに保存
     with open(output_json, "w", encoding="utf-8") as f:
